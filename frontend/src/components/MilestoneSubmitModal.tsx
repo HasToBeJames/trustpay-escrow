@@ -4,6 +4,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { useWalletStore } from '@/store/walletStore';
 import { authFetch } from '@/lib/api';
+import { useEscapeKey } from '@/hooks/useEscapeKey';
 import { submitMilestoneOnChain, type TxStage } from '@/lib/soroban';
 import {
   deliverableSubmissionSchema,
@@ -15,6 +16,8 @@ import {
 import type { Milestone, Project } from '@/types';
 import { ImageLightboxModal } from './ImageLightboxModal';
 import { MarkdownDeliverableEditor } from './MarkdownDeliverableEditor';
+import { DeliverableDiffViewer } from './DeliverableDiffViewer';
+import { DeliverableFolderTree } from './DeliverableFolderTree';
 
 const MAX_FILES = 20;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
@@ -27,6 +30,8 @@ interface AttachedFile {
   progress: number;
   previewUrl?: string;
   bytes?: ArrayBuffer;
+  /** SHA-256 of the file, computed in the browser before upload (#254). */
+  sha256?: string;
   error?: string;
 }
 
@@ -53,8 +58,9 @@ function toHex(buffer: ArrayBuffer): string {
 export async function buildDeliverableHash(notes: string, githubPrUrls: string[], files: AttachedFile[]): Promise<string> {
   const fileDigests = await Promise.all(
     files.map(async (file) => {
-      if (!file.bytes || typeof window === 'undefined' || !window.crypto?.subtle) return 'unavailable';
-      return toHex(await window.crypto.subtle.digest('SHA-256', file.bytes));
+      if (file.sha256) return file.sha256;
+      if (!file.bytes || !hasSubtleCrypto()) return 'unavailable';
+      return sha256Hex(file.bytes);
     })
   );
   const payload = JSON.stringify({
@@ -90,6 +96,7 @@ export function MilestoneSubmitModal({
   const [isDragging, setIsDragging] = useState(false);
   const [lightbox, setLightbox] = useState<{ url: string; name: string } | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [showDiff, setShowDiff] = useState(false);
   const [txStatus, setTxStatus] = useState<{ stage: TxStage | 'validating'; message: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const objectUrlsRef = useRef<string[]>([]);
@@ -98,14 +105,9 @@ export function MilestoneSubmitModal({
     objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
   }, []);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !submitting) onClose();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isOpen, onClose, submitting]);
+  useEscapeKey(() => {
+    if (!submitting) onClose();
+  }, isOpen);
 
   if (!isOpen) return null;
 
@@ -148,9 +150,16 @@ export function MilestoneSubmitModal({
         }
       };
       reader.onload = () => {
+        const bytes = reader.result as ArrayBuffer;
         setFiles((previous) => previous.map((item) => item.id === entry.id
-          ? { ...item, progress: 100, bytes: reader.result as ArrayBuffer }
+          ? { ...item, progress: 100, bytes }
           : item));
+        // Hash client-side so the checksum is recorded with the submission (#254).
+        if (hasSubtleCrypto()) {
+          sha256Hex(bytes)
+            .then((sha256) => setFiles((previous) => previous.map((item) => item.id === entry.id ? { ...item, sha256 } : item)))
+            .catch(() => undefined);
+        }
       };
       reader.onerror = () => {
         setFiles((previous) => previous.map((item) => item.id === entry.id
@@ -247,7 +256,7 @@ export function MilestoneSubmitModal({
 
       const attachments = [
         ...prLinks.map((url) => `- Pull Request: ${url}`),
-        ...files.map((file) => `- Attachment: ${file.name} (${formatBytes(file.size)})`),
+        ...files.map((file) => formatAttachmentLine(file.name, formatBytes(file.size), file.sha256)),
       ];
       const deliverableNotes = `${notes.trim()}\n\n### Links & Attachments\n${attachments.length > 0 ? attachments.join('\n') : '_None provided_'}`;
 
@@ -477,6 +486,15 @@ export function MilestoneSubmitModal({
                       <p className={`mt-1 text-[10px] ${file.error ? 'text-red-400' : 'text-[#71717a]'}`}>
                         {file.error || (file.progress === 100 ? 'Ready' : `Processing ${file.progress}%`)}
                       </p>
+                      {file.sha256 && (
+                        <p
+                          className="mt-0.5 font-mono text-[10px] text-emerald-400"
+                          title={file.sha256}
+                          data-testid={`attachment-hash-${file.id}`}
+                        >
+                          {truncateHash(file.sha256)}
+                        </p>
+                      )}
                     </div>
                     <button
                       type="button"
@@ -489,6 +507,15 @@ export function MilestoneSubmitModal({
                   </li>
                 ))}
               </ul>
+            )}
+
+            {files.length > 0 && (
+              <div className="mt-3">
+                <DeliverableFolderTree
+                  files={files.map((f) => ({ path: f.name, size: f.size, url: f.previewUrl }))}
+                  title="Deliverable Files Hierarchy"
+                />
+              </div>
             )}
           </section>
 
